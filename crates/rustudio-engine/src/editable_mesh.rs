@@ -1247,6 +1247,57 @@ pub fn note_edit(m: &mut Mesh, name: &str, args: &MultiValue) {
     }
 }
 
+/// MergeVertices' pairs (merged vertex → the vertex it merged into): each
+/// vertex, in id order, takes every later one not yet merged within `tol`
+/// studs. Found through a uniform grid of `tol`-sized cells (only the 27
+/// cells around a vertex can hold one within `tol`), so a mesh of n
+/// vertices costs about n lookups rather than n² distance tests (20 000
+/// vertices: 200 M tests before). Same pairs as the all-pairs scan
+/// (`merge_map_matches_all_pairs`).
+pub fn merge_map(vs: &[(u64, Vec3)], tol: f32) -> Vec<(u64, u64)> {
+    let mut map = Vec::new();
+    if !(tol >= 0.0) || vs.len() < 2 {
+        return map;
+    }
+    // A zero tolerance merges coincident vertices only; any positive cell
+    // size works for it.
+    let cell = tol.max(1e-4);
+    let key = |p: Vec3| -> [i64; 3] { [p.x, p.y, p.z].map(|c| (c / cell).floor() as i64) };
+    let mut grid: HashMap<[i64; 3], Vec<usize>> = HashMap::with_capacity(vs.len());
+    for (i, (_, p)) in vs.iter().enumerate() {
+        if p.is_finite() {
+            grid.entry(key(*p)).or_default().push(i);
+        }
+    }
+    let mut gone = vec![false; vs.len()];
+    let mut near: Vec<usize> = Vec::new();
+    for (i, (a, pa)) in vs.iter().enumerate() {
+        if gone[i] || !pa.is_finite() {
+            continue;
+        }
+        let k = key(*pa);
+        near.clear();
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if let Some(c) = grid.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
+                        near.extend(c.iter().copied().filter(|&j| j > i && !gone[j]));
+                    }
+                }
+            }
+        }
+        // In id order, as the all-pairs scan pushes them.
+        near.sort_unstable();
+        for &j in &near {
+            if pa.distance(vs[j].1) <= tol {
+                gone[j] = true;
+                map.push((vs[j].0, *a));
+            }
+        }
+    }
+    map
+}
+
 pub fn call(lua: &Lua, m: &mut Mesh, name: &str, args: &MultiValue) -> mlua::Result<Option<MultiValue>> {
     // The call a per-frame vertex painter makes thousands of times: no
     // argument copies, no walk down the name list.
@@ -1781,19 +1832,7 @@ pub fn call(lua: &Lua, m: &mut Mesh, name: &str, args: &MultiValue) -> mlua::Res
         "MergeVertices" => {
             let tol = num(&a1).ok_or_else(|| rt_err("Argument 1 missing or nil"))? as f32;
             let vs: Vec<(u64, Vec3)> = m.verts.iter().map(|(i, v)| (i, v.p)).collect();
-            let mut map: Vec<(u64, u64)> = Vec::new();
-            let mut gone: HashSet<u64> = HashSet::new();
-            for (i, (a, pa)) in vs.iter().enumerate() {
-                if gone.contains(a) {
-                    continue;
-                }
-                for (b, pb) in &vs[i + 1..] {
-                    if !gone.contains(b) && pa.distance(*pb) <= tol {
-                        gone.insert(*b);
-                        map.push((*b, *a));
-                    }
-                }
-            }
+            let map = merge_map(&vs, tol);
             let lookup: HashMap<u64, u64> = map.iter().copied().collect();
             for s in m.faces.order.clone() {
                 if let Some(f) = m.faces.items[s as usize].as_mut() {
@@ -2110,5 +2149,83 @@ mod skinned_file_tests {
             assert_eq!(slots(1000), (vec![22, 23, 21, 1], vec![112, 65, 65, 13]));
             assert!(m.skinned());
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    /// The all-pairs scan MergeVertices used before the grid.
+    fn all_pairs(vs: &[(u64, Vec3)], tol: f32) -> Vec<(u64, u64)> {
+        let mut map = Vec::new();
+        let mut gone: HashSet<u64> = HashSet::new();
+        for (i, (a, pa)) in vs.iter().enumerate() {
+            if gone.contains(a) {
+                continue;
+            }
+            for (b, pb) in &vs[i + 1..] {
+                if !gone.contains(b) && pa.distance(*pb) <= tol {
+                    gone.insert(*b);
+                    map.push((*b, *a));
+                }
+            }
+        }
+        map
+    }
+
+    /// A small deterministic generator (no rand dependency).
+    fn lcg(s: &mut u64) -> f32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 33) as f32) / (1u64 << 31) as f32
+    }
+
+    #[test]
+    fn merge_map_matches_all_pairs() {
+        let mut seed = 7u64;
+        for &(n, span, tol) in &[
+            (400usize, 10.0f32, 0.5f32),
+            (400, 2.0, 0.3),
+            (300, 50.0, 0.0),
+            (300, 1.0, 2.0),
+            (200, 1000.0, 0.01),
+        ] {
+            let mut vs: Vec<(u64, Vec3)> = (0..n)
+                .map(|i| {
+                    let p = Vec3::new(lcg(&mut seed), lcg(&mut seed), lcg(&mut seed)) * span - span * 0.5;
+                    (i as u64 + 1, p)
+                })
+                .collect();
+            // exact duplicates, and points straddling cell borders
+            for i in 0..n / 10 {
+                let p = vs[i * 3 % n].1;
+                vs.push(((n + i) as u64 + 1, p));
+            }
+            vs.push((9_000_001, Vec3::new(tol, 0.0, 0.0)));
+            vs.push((9_000_002, Vec3::ZERO));
+            vs.push((9_000_003, Vec3::new(f32::NAN, 0.0, 0.0)));
+            assert_eq!(merge_map(&vs, tol), all_pairs(&vs, tol), "n={n} span={span} tol={tol}");
+        }
+        assert!(merge_map(&[(1, Vec3::ZERO), (2, Vec3::ZERO)], -1.0).is_empty());
+    }
+
+    #[test]
+    fn merge_map_is_fast_on_big_meshes() {
+        // A 150×150 grid of quads' corners, each written twice (as an
+        // unwelded export is): 45 000 vertices, all-pairs would be ~1e9 tests.
+        let mut vs = Vec::new();
+        let mut id = 1u64;
+        for _ in 0..2 {
+            for x in 0..150 {
+                for z in 0..150 {
+                    vs.push((id, Vec3::new(x as f32, 0.0, z as f32)));
+                    id += 1;
+                }
+            }
+        }
+        let t = std::time::Instant::now();
+        let map = merge_map(&vs, 0.001);
+        assert_eq!(map.len(), 150 * 150);
+        assert!(t.elapsed().as_secs_f32() < 2.0, "took {:?}", t.elapsed());
     }
 }

@@ -3290,3 +3290,301 @@ fn grass_template(i: usize) -> (glam::Vec3, glam::Vec3) {
     let across = glam::Vec3::new(-heading.sin(), 0.0, heading.cos());
     (base, glam::Vec3::Y * lean.cos() + across * lean.sin())
 }
+
+// ---------------------------------------------------------------- smoothing
+
+const N6: [[i32; 3]; 6] = [[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]];
+
+/// Stand-in for the engine's Terrain:SmoothRegion(region, 4, strength):
+/// the occupancies as a signed distance (studs, + inside) reaching two
+/// voxels past the surface, averaged over each voxel's 3×3×3 block, back
+/// to occupancy, blended by `strength`. Materials: a voxel that fills
+/// takes its most common solid neighbour's. (Moved from the app's
+/// terrain_brush.rs so the runtime's Terrain:SmoothRegion shares it.)
+///
+/// The 3×3×3 average is done as three 3-tap passes (the edge clamp is per
+/// axis, so the box sum separates exactly): 9 reads a voxel instead of 27.
+/// The chamfer passes reuse one scratch buffer instead of cloning the
+/// field each pass.
+pub fn smooth_region(b_mat: &[u8], b_occ: &[f32], n: [i32; 3], strength: f32) -> (Vec<u8>, Vec<f32>) {
+    const VR: f32 = VOXEL;
+    let idx = |x: i32, y: i32, z: i32| (x + n[0] * (y + n[1] * z)) as usize;
+    let inside = |x: i32, y: i32, z: i32| x >= 0 && y >= 0 && z >= 0 && x < n[0] && y < n[1] && z < n[2];
+    let len = b_occ.len();
+    if len == 0 || n.iter().any(|&c| c <= 0) {
+        return (b_mat.to_vec(), b_occ.to_vec());
+    }
+    // Distance: partial voxels know theirs; full / empty ones take the
+    // nearest surface (chamfer passes), capped at 3 voxels.
+    let cap = 3.0 * VR;
+    let mut sdf = vec![0.0f32; len];
+    let mut known = vec![false; len];
+    for i in 0..len {
+        let o = if b_mat[i] == 0 { 0.0 } else { b_occ[i] };
+        if o > 0.0 && o < 1.0 {
+            sdf[i] = (o - 0.5) * VR;
+            known[i] = true;
+        } else {
+            sdf[i] = if o >= 1.0 { cap } else { -cap };
+        }
+    }
+    // Faces between a full and an empty voxel put the surface half way.
+    for z in 0..n[2] {
+        for y in 0..n[1] {
+            for x in 0..n[0] {
+                let i = idx(x, y, z);
+                if known[i] {
+                    continue;
+                }
+                let solid = sdf[i] > 0.0;
+                for d in N6 {
+                    let (a, bb, c) = (x + d[0], y + d[1], z + d[2]);
+                    if inside(a, bb, c) {
+                        let j = idx(a, bb, c);
+                        if !known[j] && (sdf[j] > 0.0) != solid {
+                            sdf[i] = if solid { VR * 0.5 } else { -VR * 0.5 };
+                            known[i] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Chamfer: distances grow by a voxel per step away from the surface.
+    let mut prev = vec![0.0f32; len];
+    for _ in 0..3 {
+        prev.copy_from_slice(&sdf);
+        for z in 0..n[2] {
+            for y in 0..n[1] {
+                for x in 0..n[0] {
+                    let i = idx(x, y, z);
+                    if known[i] {
+                        continue;
+                    }
+                    let s = prev[i].signum();
+                    let mut best = prev[i].abs();
+                    for d in N6 {
+                        let (a, bb, c) = (x + d[0], y + d[1], z + d[2]);
+                        if inside(a, bb, c) {
+                            let j = idx(a, bb, c);
+                            if prev[j].signum() == s || prev[j] == 0.0 {
+                                best = best.min(prev[j].abs() + VR);
+                            } else {
+                                best = best.min(VR * 0.5);
+                            }
+                        }
+                    }
+                    sdf[i] = s * best.min(cap);
+                }
+            }
+        }
+    }
+    // 3×3×3 box sum, separably; outside the box the field carries on as at
+    // the edge (clamped per axis).
+    let tap3 = |src: &[f32], dst: &mut [f32], axis: usize| {
+        for z in 0..n[2] {
+            for y in 0..n[1] {
+                for x in 0..n[0] {
+                    let p = [x, y, z];
+                    let mut s = 0.0;
+                    for d in -1..=1 {
+                        let mut q = p;
+                        q[axis] = (q[axis] + d).clamp(0, n[axis] - 1);
+                        s += src[idx(q[0], q[1], q[2])];
+                    }
+                    dst[idx(x, y, z)] = s;
+                }
+            }
+        }
+    };
+    tap3(&sdf, &mut prev, 0);
+    tap3(&prev, &mut sdf, 1);
+    tap3(&sdf, &mut prev, 2);
+    let summed = prev;
+    let mut mat = b_mat.to_vec();
+    let mut occ = b_occ.to_vec();
+    for z in 0..n[2] {
+        for y in 0..n[1] {
+            for x in 0..n[0] {
+                let i = idx(x, y, z);
+                let d = summed[i] / 27.0;
+                let target = (0.5 + d / VR).clamp(0.0, 1.0);
+                let o0 = if b_mat[i] == 0 { 0.0 } else { b_occ[i] };
+                let o = o0 + (target - o0) * strength;
+                occ[i] = o;
+                if b_mat[i] == 0 && o > 0.0 {
+                    // the most common solid material around
+                    let mut count = [0u32; 32];
+                    for dz in -1..=1 {
+                        for dy in -1..=1 {
+                            for dx in -1..=1 {
+                                let (a, bb, c) = (x + dx, y + dy, z + dz);
+                                if inside(a, bb, c) {
+                                    let m = b_mat[idx(a, bb, c)] as usize;
+                                    if m != 0 && m < 32 {
+                                        count[m] += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let best = (1..32).max_by_key(|m| count[*m]).filter(|m| count[*m] > 0);
+                    mat[i] = best.map_or(0, |m| m as u8);
+                } else if o <= 0.0 {
+                    mat[i] = 0;
+                }
+            }
+        }
+    }
+    (mat, occ)
+}
+
+#[cfg(test)]
+mod smooth_tests {
+    use super::*;
+
+    // The kernel as terrain_brush.rs had it (27-tap average, field clone
+    // per chamfer pass), to check the separable one against.
+    fn smooth_region_ref(b_mat: &[u8], b_occ: &[f32], n: [i32; 3], strength: f32) -> (Vec<u8>, Vec<f32>) {
+        let idx = |x: i32, y: i32, z: i32| (x + n[0] * (y + n[1] * z)) as usize;
+        let inside = |x: i32, y: i32, z: i32| x >= 0 && y >= 0 && z >= 0 && x < n[0] && y < n[1] && z < n[2];
+        let len = b_occ.len();
+        // Distance: partial voxels know theirs; full / empty ones take the
+        // nearest surface (chamfer passes), capped at 3 voxels.
+        let cap = 3.0 * VOXEL;
+        let mut sdf = vec![0.0f32; len];
+        let mut known = vec![false; len];
+        for i in 0..len {
+            let o = if b_mat[i] == 0 { 0.0 } else { b_occ[i] };
+            if o > 0.0 && o < 1.0 {
+                sdf[i] = (o - 0.5) * VOXEL;
+                known[i] = true;
+            } else {
+                sdf[i] = if o >= 1.0 { cap } else { -cap };
+            }
+        }
+        // Faces between a full and an empty voxel put the surface half way.
+        for z in 0..n[2] {
+            for y in 0..n[1] {
+                for x in 0..n[0] {
+                    let i = idx(x, y, z);
+                    if known[i] {
+                        continue;
+                    }
+                    let solid = sdf[i] > 0.0;
+                    for d in N6 {
+                        let (a, bb, c) = (x + d[0], y + d[1], z + d[2]);
+                        if inside(a, bb, c) {
+                            let j = idx(a, bb, c);
+                            if !known[j] && (sdf[j] > 0.0) != solid {
+                                sdf[i] = if solid { VOXEL * 0.5 } else { -VOXEL * 0.5 };
+                                known[i] = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Chamfer: distances grow by a voxel per step away from the surface.
+        for _ in 0..3 {
+            let prev = sdf.clone();
+            for z in 0..n[2] {
+                for y in 0..n[1] {
+                    for x in 0..n[0] {
+                        let i = idx(x, y, z);
+                        if known[i] {
+                            continue;
+                        }
+                        let s = prev[i].signum();
+                        let mut best = prev[i].abs();
+                        for d in N6 {
+                            let (a, bb, c) = (x + d[0], y + d[1], z + d[2]);
+                            if inside(a, bb, c) {
+                                let j = idx(a, bb, c);
+                                if prev[j].signum() == s || prev[j] == 0.0 {
+                                    best = best.min(prev[j].abs() + VOXEL);
+                                } else {
+                                    best = best.min(VOXEL * 0.5);
+                                }
+                            }
+                        }
+                        sdf[i] = s * best.min(cap);
+                    }
+                }
+            }
+        }
+        let mut mat = b_mat.to_vec();
+        let mut occ = b_occ.to_vec();
+        for z in 0..n[2] {
+            for y in 0..n[1] {
+                for x in 0..n[0] {
+                    let i = idx(x, y, z);
+                    let (mut sum, mut cnt) = (0.0, 0.0);
+                    for dz in -1..=1 {
+                        for dy in -1..=1 {
+                            for dx in -1..=1 {
+                                let (a, bb, c) = (x + dx, y + dy, z + dz);
+                                // Outside the box the field carries on as at the edge.
+                                let (a, bb, c) = (a.clamp(0, n[0] - 1), bb.clamp(0, n[1] - 1), c.clamp(0, n[2] - 1));
+                                sum += sdf[idx(a, bb, c)];
+                                cnt += 1.0;
+                            }
+                        }
+                    }
+                    let d = sum / cnt;
+                    let target = (0.5 + d / VOXEL).clamp(0.0, 1.0);
+                    let o0 = if b_mat[i] == 0 { 0.0 } else { b_occ[i] };
+                    let o = o0 + (target - o0) * strength;
+                    occ[i] = o;
+                    if b_mat[i] == 0 && o > 0.0 {
+                        // the most common solid material around
+                        let mut count = [0u32; 32];
+                        for dz in -1..=1 {
+                            for dy in -1..=1 {
+                                for dx in -1..=1 {
+                                    let (a, bb, c) = (x + dx, y + dy, z + dz);
+                                    if inside(a, bb, c) {
+                                        let m = b_mat[idx(a, bb, c)] as usize;
+                                        if m != 0 && m < 32 {
+                                            count[m] += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let best = (1..32).max_by_key(|m| count[*m]).filter(|m| count[*m] > 0);
+                        mat[i] = best.map_or(0, |m| m as u8);
+                    } else if o <= 0.0 {
+                        mat[i] = 0;
+                    }
+                }
+            }
+        }
+        (mat, occ)
+    }
+
+    fn lcg(s: &mut u64) -> f32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 33) as f32) / (1u64 << 31) as f32
+    }
+
+    #[test]
+    fn separable_smooth_matches_the_27_tap_one() {
+        let mut seed = 11u64;
+        for n in [[1, 1, 1], [3, 3, 3], [8, 5, 7], [12, 12, 12], [2, 9, 4]] {
+            let len = (n[0] * n[1] * n[2]) as usize;
+            for strength in [0.0, 0.3, 1.0] {
+                let mat: Vec<u8> = (0..len).map(|_| if lcg(&mut seed) < 0.45 { 0 } else { 2 + (lcg(&mut seed) * 4.0) as u8 }).collect();
+                let occ: Vec<f32> = (0..len).map(|_| { let r = lcg(&mut seed); if r < 0.4 { 1.0 } else { r } }).collect();
+                let (m1, o1) = smooth_region(&mat, &occ, n, strength);
+                let (m2, o2) = smooth_region_ref(&mat, &occ, n, strength);
+                assert_eq!(m1, m2, "materials n={n:?} s={strength}");
+                for (a, b) in o1.iter().zip(&o2) {
+                    assert!((a - b).abs() < 1e-5, "occupancy {a} vs {b} n={n:?} s={strength}");
+                }
+            }
+        }
+    }
+}

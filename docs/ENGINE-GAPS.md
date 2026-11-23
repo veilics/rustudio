@@ -48,11 +48,15 @@ back inside their pcalls and every camo'd gun drew plain grey. Now
   `rustudio: Class.Member is a stub (it does nothing here)` to Output (once
   per member), so a test can't pass on one silently.
 
+Since done (editable_mesh.rs, editable.rs, project.rs): bones / FACS,
+DrawImageProjected / SampleImageProjected, MergeVertices / Triangulate and
+the *WithAttribute queries. MergeVertices finds its pairs through a grid
+(`merge_map`, the same pairs as the all-pairs scan it replaced, which was
+n² distance tests: a 45 000-vertex unwelded mesh took seconds).
+
 Still open: edits to an EditableMesh after CreateMeshPartAsync don't reach
 the MeshPart (it holds a snapshot; CamoLayers' animated shell UVs stay at
-their first frame); bones / FACS, DrawImageProjected / SampleImageProjected,
-MergeVertices / Triangulate and the *WithAttribute queries are stubs; no
-Editable* memory budget (Create* never returns nil); EditableImage /
+their first frame); no Editable* memory budget (Create* never returns nil); EditableImage /
 EditableMesh are Instances here (typeof "Instance", Roblox: "Object").
 
 ## Round 19: the whole corpus, and what was wrong rather than missing
@@ -66,7 +70,7 @@ members that existed but behaved wrongly, found by the diff against Studio:
 | # | Calls | Member | Kind | Places | Status |
 |---|---|---|---|---|---|
 | 1 | 15 | Terrain:SetMaterialColor (and GetMaterialColor) | stub-call | Place C (Main: every biome's colours) | **done**: writes / reads Terrain.MaterialColors (23 RGB slots), replicated; the drawn terrain follows |
-| 2 | 1 (+ every landing) | Terrain:FillBlock, with FillBall / FillCylinder / FillWedge / FillRegion / Clear / ReplaceMaterial | call-unimplemented | Place B (water blocks); Place C builds every planet surface with ~700 FillBlocks on landing (not reached in the 40 s run) | **done**: voxels edited and written back to SmoothGrid once a step (drawn, collided, replicated). WriteVoxels / ReadVoxels / SetCell still open (no corpus caller) |
+| 2 | 1 (+ every landing) | Terrain:FillBlock, with FillBall / FillCylinder / FillWedge / FillRegion / Clear / ReplaceMaterial | call-unimplemented | Place B (water blocks); Place C builds every planet surface with ~700 FillBlocks on landing (not reached in the 40 s run) | **done**: voxels edited and written back to SmoothGrid once a step (drawn, collided, replicated). WriteVoxels / ReadVoxels / Read/WriteVoxelChannels / CopyRegion / PasteRegion since done; SetCell (deprecated cell API) still open |
 | – | every terrain ray | WorldRoot:Raycast, FindPartOnRay… | wrong: never hit terrain | any place with terrain | **done**: hits the voxels' surface with its material and normal (water not yet) |
 | – | every frame | CFrame `toAxisAngle` (and `lerp`, `toEulerAngles*`, `toOrientation`, Color3 `lerp`) | missing lowercase aliases | Place B's Poppercam | **done** (Studio's list, probed) |
 | – | once per PlayerModule | UserSettings():IsUserFeatureEnabled | wrong: errored on 16 names Studio answers | Place B, Place C, Place A | **done**: Studio's values; Place B's camera now pulls in like Studio's |
@@ -633,7 +637,8 @@ Look (round 3, compared with the real client's captures):
   (Builder Sans Bold 25, the Foundation token) in content-emphasis white.
 
 Still open: the Respawn confirmation page draws its text tiny.
-TextService:GetTextSizeOffsetAsync is still a stub. The Help tab wraps
+TextService:GetTextSizeOffsetAsync answers 0 (Medium, estimate; see
+above). The Help tab wraps
 "Drop tool", "Use tool" and "Mouse lock" (Roblox doesn't) and its Camera
 movement / Menu items groups are not on screen; setting FontFace doesn't
 set Font back; `<stroke>` rich text tags are read but not drawn.

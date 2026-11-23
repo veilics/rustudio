@@ -510,6 +510,24 @@ fn box_distance(p: Vec3, h: Vec3) -> f32 {
     (p.abs() - h).max_element()
 }
 
+/// Enum.Material values by SmoothGrid index, each made once per call:
+/// ReadVoxels / ReadVoxelChannels looked the item up by name, built two
+/// Strings and a registry key for every voxel (a 64³ read is 262 144).
+#[derive(Default)]
+struct MaterialValues(std::collections::HashMap<u8, Value>);
+
+fn material_value(lua: &Lua, cache: &mut MaterialValues, m: u8) -> mlua::Result<Value> {
+    if let Some(v) = cache.0.get(&m) {
+        return Ok(v.clone());
+    }
+    let v = LEnumItem::from_name("Material", rustudio_core::terrain::material_name(m))
+        .map(|e| crate::ltypes::enum_value(lua, e))
+        .transpose()?
+        .unwrap_or(Value::Nil);
+    cache.0.insert(m, v.clone());
+    Ok(v)
+}
+
 /// Terrain editing (Roblox's Terrain:Fill…, Clear, ReplaceMaterial and the
 /// material colours), round 19: Place C builds its planet surfaces with
 /// FillBlock, Place B its water. Edits go to a decoded copy of the voxels
@@ -745,6 +763,7 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
                     _ => return Err(rt_err("Terrain:ReadVoxelChannels: channel names expected")),
                 };
                 let out = lua.create_table()?;
+                let mut items = MaterialValues::default();
                 for ch in CHANNELS.iter().filter(|c| wanted.iter().any(|w| w == *c)) {
                     let t = lua.create_table()?;
                     for x in 0..n.x {
@@ -754,10 +773,7 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
                             for z in 0..n.z {
                                 let (m, so, lo) = read(a + glam::IVec3::new(x, y, z));
                                 let item = match *ch {
-                                    "SolidMaterial" => LEnumItem::from_name("Material", terrain::material_name(m))
-                                        .map(|e| crate::ltypes::enum_value(lua, e))
-                                        .transpose()?
-                                        .unwrap_or(Value::Nil),
+                                    "SolidMaterial" => material_value(lua, &mut items, m)?,
                                     "SolidOccupancy" => Value::Number(so as f64),
                                     _ => Value::Number(lo as f64),
                                 };
@@ -837,6 +853,7 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
             if name == "ReadVoxels" {
                 let mats = lua.create_table()?;
                 let occs = lua.create_table()?;
+                let mut items = MaterialValues::default();
                 for x in 0..n.x {
                     let (mx, ox) = (lua.create_table()?, lua.create_table()?);
                     for y in 0..n.y {
@@ -846,10 +863,7 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
                             let (m, o) = voxels.get(v.x, v.y, v.z);
                             let w = voxels.water(v.x, v.y, v.z);
                             let (m, o) = if m == 0 && w > 0.0 { (terrain::WATER, w) } else { (m, o) };
-                            let item = LEnumItem::from_name("Material", terrain::material_name(m))
-                                .map(|e| crate::ltypes::enum_value(lua, e))
-                                .transpose()?
-                                .unwrap_or(Value::Nil);
+                            let item = material_value(lua, &mut items, m)?;
                             my.raw_set(z + 1, item)?;
                             oy.raw_set(z + 1, o as f64)?;
                         }
