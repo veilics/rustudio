@@ -882,9 +882,20 @@ impl Game {
         // session's copy is made; the edit document is what Stop brings back)
         let mut edit_doc = teleport.map(|t| std::mem::replace(&mut self.doc, t.doc));
         let label = if two { "Play" } else { "Run" };
-        let mut server_doc = self
-            .doc
-            .clone_for_play(format!("{} ({label}: Server)", self.doc.title));
+        let title = self.doc.title.clone();
+        // A play worker's document is a copy made for this session already
+        // (start_play_threaded): it becomes the server DataModel as it is.
+        // Copying it again held a fourth copy of the place for the whole
+        // session and took as long as the first (a million-instance place:
+        // ~1 GB and ~6 s more, and the session's start ran out of memory).
+        let take = std::mem::take(&mut self.doc_is_play_copy) && edit_doc.is_none();
+        let mut server_doc = if take {
+            let mut d = std::mem::replace(&mut self.doc, Document::placeholder());
+            d.title = format!("{title} ({label}: Server)");
+            d
+        } else {
+            self.doc.clone_for_play(format!("{title} ({label}: Server)"))
+        };
         // Roblox's default PlayerModule, PlayerScriptsLoader and
         // RbxCharacterSounds join StarterPlayerScripts, as Studio does.
         // Every Roblox DataModel has these services, even when the file
@@ -952,7 +963,7 @@ impl Game {
         let (client_doc, map) = if two {
             let (c, m) = replicate::initial_client(
                 &server_doc,
-                format!("{} ({label}: Client)", self.doc.title),
+                format!("{title} ({label}: Client)"),
             );
             (Some(c), m)
         } else {

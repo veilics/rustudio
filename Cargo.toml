@@ -182,6 +182,10 @@ egui_dock = { path = "vendor/egui_dock" }
 # end-first child removal: bulk Destroy / ClearAllChildren without a scan
 # of the parent's child list per child (round 2 perf, bulk).
 rbx_dom_weak = { path = "vendor/rbx_dom_weak" }
+# rbx_binary 3.0.1 + Deserializer::skip_defaults (marked rustudio): a
+# property value equal to what the reader falls back to isn't stored
+# (doc.rs implied_default). A 44 MB place parsed to 4.8 GB, 69% defaults.
+rbx_binary = { path = "vendor/rbx_binary" }
 # rapier3d 0.36.1 + CollisionPipeline::contact_recycle_distance (marked
 # rustudio): the Studio solver port (the default; src/solver) runs
 # rapier's collision detection alone and needs its contact recycling to cost

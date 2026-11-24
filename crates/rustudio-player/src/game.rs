@@ -30,6 +30,10 @@ pub struct Game {
     /// The place the next `start_play` plays instead of the edit document,
     /// and how its player arrives (a teleport).
     pub teleport_to: Option<crate::play_teleport::Teleport>,
+    /// `doc` is already Play's server copy (a play worker's, made by
+    /// `start_play_threaded`): `start_play` takes it as the server DataModel
+    /// instead of copying it again.
+    pub doc_is_play_copy: bool,
     /// The live Team Create (universe, place) the Play session began on.
     pub(crate) play_origin: Option<(u64, u64)>,
     /// Stop without the "■ Stopped" line (a teleport's session change).
@@ -175,6 +179,7 @@ impl Game {
             play_thread: None,
             teleport_job: None,
             teleport_to: None,
+            doc_is_play_copy: false,
             quiet_stop: false,
             play_origin: None,
             play_input_pose_due: false,

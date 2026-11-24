@@ -23,6 +23,8 @@ fn addr(key: Ustr) -> usize {
 pub(crate) struct Template {
     keys: Vec<Ustr>,
     vals: Vec<Variant>,
+    /// Whether any shared value is a Ref (`PropMap::has_refs`).
+    has_refs: bool,
 }
 
 impl Template {
@@ -243,9 +245,23 @@ impl PropMap {
         }
     }
 
+    /// Whether any value is a `Variant::Ref`, without walking the shared
+    /// values (a copy's reference fix-up skips the maps that have none:
+    /// most of a place's instances).
+    pub fn has_refs(&self) -> bool {
+        self.base.as_ref().is_some_and(|t| t.has_refs)
+            || self.vals.iter().any(|s| matches!(s, Slot::Value(Variant::Ref(_))))
+    }
+
     /// Whether the map shares values with its class (`WeakDom::share_properties`).
     pub fn is_shared(&self) -> bool {
         self.base.is_some()
+    }
+
+    /// The keys this map holds itself: values that differ from its class's
+    /// shared ones, and shared keys it lacks (memory reports).
+    pub fn own_keys(&self) -> &[Ustr] {
+        &self.keys
     }
 
     /// Bytes this map holds itself (not the shared values), roughly.
@@ -280,6 +296,19 @@ impl PropMap {
         self.vals = out_vals;
         self.base = Some(template.clone());
     }
+}
+
+/// `WeakDom::share_properties` for maps not in a dom yet (a file reader's,
+/// one class at a time): the maps of one class share what they have in
+/// common. Maps already sharing are left as they are; fewer than 8 maps
+/// share nothing (as in `share_properties`). Returns how many share now.
+pub fn share_maps(maps: &mut [&mut PropMap]) -> usize {
+    let mut fresh: Vec<&mut PropMap> = maps.iter_mut().filter(|m| !m.is_shared()).map(|m| &mut **m).collect();
+    if fresh.len() < 8 {
+        return 0;
+    }
+    share(&mut fresh);
+    fresh.iter().filter(|m| m.is_shared()).count()
 }
 
 /// Finds what the maps of one class have in common and makes them share it.
@@ -325,8 +354,9 @@ pub(crate) fn share<'a>(maps: &mut [&'a mut PropMap]) {
         return;
     }
     pairs.sort_by_key(|(k, _)| addr(*k));
-    let (keys, vals) = pairs.into_iter().unzip();
-    let template = Arc::new(Template { keys, vals });
+    let (keys, vals): (Vec<Ustr>, Vec<Variant>) = pairs.into_iter().unzip();
+    let has_refs = vals.iter().any(|v: &Variant| matches!(v, Variant::Ref(_)));
+    let template = Arc::new(Template { keys, vals, has_refs });
     for map in maps.iter_mut() {
         map.rebase(&template);
     }

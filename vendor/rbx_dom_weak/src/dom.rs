@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use ahash::{AHashMap, AHashSet};
 use rbx_types::{Ref, UniqueId, Variant};
-use ustr::ustr;
+use ustr::{ustr, Ustr};
 
 use crate::instance::{Instance, InstanceBuilder};
 
@@ -153,6 +153,16 @@ impl WeakDom {
             root_ref,
             unique_ids,
         }
+    }
+
+    /// How many instances the dom holds (rustudio: sizing a copy up front).
+    pub fn len(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Whether the dom holds no instances (never, with its root).
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
     }
 
     /// Reserve at least enough space for `additional` number of instances in
@@ -560,6 +570,18 @@ impl WeakDom {
     pub fn clone_multiple_into_external(&self, referents: &[Ref], dest: &mut WeakDom) -> Vec<Ref> {
         let mut ctx = CloneContext::default();
         let mut root_refs = Vec::with_capacity(referents.len());
+        // (rustudio: the copy's size, counted first, sizes its tables once;
+        // a whole place's copy for Play rehashed them ~20 times)
+        let mut count = 0usize;
+        let mut stack: Vec<Ref> = referents.to_vec();
+        while let Some(r) = stack.pop() {
+            if let Some(i) = self.instances.get(&r) {
+                count += 1;
+                stack.extend_from_slice(&i.children);
+            }
+        }
+        ctx.ref_rewrites.reserve(count);
+        dest.reserve(count);
 
         for referent in referents {
             let builder = ctx.clone_ref_as_builder(self, *referent);
@@ -586,7 +608,10 @@ impl WeakDom {
 
         // Unwrap is safe because we just inserted this referent into the instance map
         let instance = self.instances.get_mut(&referent).unwrap();
-        if let Some(Variant::UniqueId(unique_id)) = instance.properties.get(&ustr("UniqueId")) {
+        // (interned once: ustr() locks and hashes the global table per call)
+        static UNIQUE_ID: std::sync::OnceLock<Ustr> = std::sync::OnceLock::new();
+        let key = *UNIQUE_ID.get_or_init(|| ustr("UniqueId"));
+        if let Some(Variant::UniqueId(unique_id)) = instance.properties.get(&key) {
             if self.unique_ids.contains(unique_id) {
                 // We found a collision! We need to replace the UniqueId property with
                 // a new value.
@@ -598,7 +623,7 @@ impl WeakDom {
                 self.unique_ids.insert(new_unique_id);
                 instance
                     .properties
-                    .insert(ustr("UniqueId"), Variant::UniqueId(new_unique_id));
+                    .insert(key, Variant::UniqueId(new_unique_id));
             } else {
                 self.unique_ids.insert(*unique_id);
             };
@@ -669,6 +694,9 @@ impl CloneContext {
                 .get_by_ref(*new_ref)
                 .expect("Cannot rewrite refs on an instance that does not exist");
 
+            if !instance.properties.has_refs() {
+                continue;
+            }
             for prop_value in instance.properties.values() {
                 if let Variant::Ref(value) = prop_value {
                     if dest.instances.contains_key(value) {
@@ -683,6 +711,9 @@ impl CloneContext {
                 .get_by_ref_mut(*new_ref)
                 .expect("Cannot rewrite refs on an instance that does not exist");
 
+            if !instance.properties.has_refs() {
+                continue;
+            }
             // (collected, then set one by one: walking the values mutably
             // would end the map's sharing of its class's common values)
             let mut changes = Vec::new();
@@ -716,9 +747,16 @@ impl CloneContext {
             .get_by_ref(original_ref)
             .expect("Cannot clone an instance that does not exist");
 
-        let builder = InstanceBuilder::new(instance.class)
-            .with_name(instance.name.to_string())
-            .with_prop_map(instance.properties.clone());
+        // (built directly: InstanceBuilder::new names it after its class,
+        // a String made and dropped per instance)
+        let builder = InstanceBuilder {
+            referent: crate::new_ref(),
+            name: instance.name.clone(),
+            class: instance.class,
+            properties: Vec::new(),
+            shared: Some(instance.properties.clone()),
+            children: Vec::new(),
+        };
 
         let new_ref = builder.referent;
 

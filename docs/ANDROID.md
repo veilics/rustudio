@@ -606,7 +606,31 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   start line). `RUSTUDIO_LOAD_TRACE=1` (through `debug.rustudio.env`)
   prints the full `LOADTRACE` trail instead: the place read and parsed,
   every frame over 100 ms with its biggest bench sections, the asset
-  queues as they change. What is known of the cost without a trace:
+  queues as they change, each line with the resident size (`[rss N MB]`,
+  what `lmkd` judges the app by).
+
+  Big places and memory (2026-11-24, a 44 MB place of 996 380 instances
+  that crashed on open, and a 30 MB one that froze at Play): the file's
+  25.6 M property values parsed to ~4 GB, and Play held four copies of
+  the place. Now (`rbx_binary` vendored, marked rustudio):
+  - values equal to what `Document::prop` falls back to aren't stored
+    (`doc.rs implied_default`; names read straight from a property map
+    are always kept): 12.3 M of 25.6 M stored, every read the same
+    (`implied_default_tests`; `RUSTUDIO_TEST_PLACE=<.rbxl>` runs the
+    check over a real place). `RUSTUDIO_KEEP_DEFAULTS=1` stores them all;
+  - an instance's property list isn't sized for every property its
+    class has (2.2 GB for a million instances before a value was read),
+    and each class's instances share their common values as soon as the
+    file's chunks for that class end, not after the whole file;
+  - the play worker gets Play's server copy made once
+    (`start_play_threaded`); its `start_play` takes it as the server
+    DataModel instead of copying it again (a fourth copy, ~1 GB and ~6 s);
+  - copies size their tables once and skip the reference fix-up for
+    instances without references (`rbx_dom_weak` `clone_multiple_into_external`).
+  Desktop measure of that place: open peak 4.0 → 2.6 GB (19 → 10.5 s);
+  Play out of memory past 6 GB → running at 5.7 GB. Left: Play's start
+  still blocks the UI (~12 s there) while the main thread copies the
+  place and the worker builds the client copy and starts the scripts. What is known of the cost without a trace:
   LBG is 7.3 MB of Luau in 685 scripts, 67 of them `--!native` (1.4
   MB — their machine code is no longer built as they load: they run
   interpreted for their first frames and `runtime.rs native_drain`

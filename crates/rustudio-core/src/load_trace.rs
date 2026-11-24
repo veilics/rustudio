@@ -40,7 +40,10 @@ pub fn init() {
 
 pub fn mark(what: &str) {
     if on() {
-        eprintln!("LOADTRACE {:8.3} {what}", epoch() - t0());
+        match resident_mb() {
+            Some(mb) => eprintln!("LOADTRACE {:8.3} {what} [rss {mb} MB]", epoch() - t0()),
+            None => eprintln!("LOADTRACE {:8.3} {what}", epoch() - t0()),
+        }
     }
     if startup_trace() {
         play_step(what);
@@ -187,4 +190,13 @@ pub fn assets(meshes: usize, textures_pending: usize, textures: usize) {
         *l = (meshes, textures_pending, textures, now);
         mark(&format!("assets: meshes {meshes}, textures {textures} (+{textures_pending} decoding)"));
     }
+}
+
+/// The process's resident size now (Linux and Android: /proc/self/status
+/// VmRSS), for the trace: what a step cost in memory, which on a phone is
+/// what decides whether the system ends the app.
+pub fn resident_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    line.split_whitespace().nth(1)?.parse::<u64>().ok().map(|kb| kb / 1024)
 }

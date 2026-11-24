@@ -695,7 +695,15 @@ impl Game {
                 self.push_log(level, text);
             }
         }
-        let mut doc = Document::from_play_dom(self.doc.dom.clone(), self.doc.title.clone());
+        // The worker's document: Play's server copy, made here once (as
+        // `start_play` would: fresh refs, root "Game"). A teleport plays its
+        // own destination, and the worker copies that as before.
+        let teleporting = self.teleport_to.is_some();
+        let mut doc = if teleporting {
+            Document::from_play_dom(self.doc.dom.clone(), self.doc.title.clone())
+        } else {
+            self.doc.clone_for_play(self.doc.title.clone())
+        };
         doc.kind = self.doc.kind;
         doc.path.clone_from(&self.doc.path);
         doc.cloud.clone_from(&self.doc.cloud);
@@ -713,6 +721,7 @@ impl Game {
 
         let worker = match PlayWorker::spawn(host.play_worker_host(), move |game, worker_host| {
             game.doc = doc;
+            game.doc_is_play_copy = !teleporting;
             game.teleport_to = teleport;
             game.cam = cam;
             game.account = account;

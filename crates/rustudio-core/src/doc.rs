@@ -380,6 +380,90 @@ pub fn constructor_default(class: &str, name: &str) -> Option<Variant> {
     }
 }
 
+/// Read straight from an instance's property map by name somewhere (not
+/// through `Document::prop`), so a file's value is always kept even when it
+/// is the default. (Every capitalised string within a few lines of a
+/// `properties.get` in the compiled crates, 2026-11-24: a superset, class
+/// names and all; `implied_default_keeps_direct_reads` checks a sample.)
+const KEEP_STORED: &[&str] = &[
+    "Adornee", "Anchored", "AnimationId", "Archivable", "Attachment", "Attachment0",
+    "Attachment1", "Attributes", "AutoRotate", "AvatarPartScaleType", "BaseImportData",
+    "BasePart", "BodyPart", "C0", "C1", "CFrame", "CFrame0", "CFrame1", "Camera", "Changed",
+    "CharacterMesh", "ChildData2", "ClockTime", "CloudEditCameraCoordinateFrame",
+    "CloudEditPlayerActive", "CollaboratorColor3", "CollisionFidelity", "ConfigSnapshot",
+    "Constraint", "Content", "CurDocGUID", "CurScriptLineNumber", "CurrentCamera",
+    "CustomEventReceiver", "DataModel", "Decal", "Decoration", "DisplayName",
+    "DistanceAttenuation", "DomainType", "EXPERIENCE", "Enabled", "Error", "Face", "Folder",
+    "FontFace", "GameId", "GetAttribute", "GetBaseMaterialOverride", "GlobalShadows", "Glue",
+    "GrassLength", "GuiButton", "Head", "Health", "HipHeight", "Hud", "Humanoid",
+    "HumanoidRootPart", "IgnoreGuiInset", "InitialSize", "IsIdle", "JointInstance", "Jump",
+    "JumpHeight", "JumpPower", "LeftHipRigAttachment", "Lighting", "LightingStyle",
+    "LocalPlayer", "LowerTorso", "LuaSourceContainer", "ManualWeld", "MaterialColors",
+    "MaterialImportData", "MaterialService", "MaxSlopeAngle", "MeshContent", "MeshData",
+    "MeshId", "MeshImportData", "MeshPart", "Modal", "Model", "Motor", "Motor6D",
+    "MouseBehavior", "MouseIconEnabled", "MoveDirection", "Name", "NoCollisionConstraint",
+    "NoFace", "Object", "Outdated", "PackageLink", "PackagePermission", "Part0", "Part1",
+    "PartOperation", "PartOperationAsset", "PermissionLevel", "PlaceId", "PlatformStand",
+    "Play", "Player", "Players", "Playing", "PointLight", "PrimaryPart",
+    "PrioritizeLightingQuality", "PrivateServerId", "Properties", "ReservedServerAccessCode",
+    "ResetOnSpawn", "RootImportData", "RootRigAttachment", "RunContext", "ScreenGui",
+    "ScreenInsets", "ScriptGuid", "ScrollBarImageColor3", "ServiceVisibilityService",
+    "SignalBehavior", "SignalBehavior2", "Sit", "Size", "SmoothGrid", "Snap", "Sound", "Source",
+    "SpotLight", "State", "SurfaceLight", "Tags", "Technology", "TeleportAsyncResult",
+    "Terrain", "Text", "TextFilterResult", "Texture", "TextureContent", "TimeOfDay",
+    "Transform", "Under13", "Use2022Materials", "Use2022MaterialsXml", "UseJumpPower", "UserId",
+    "UserInputService", "Username", "Value", "WalkSpeed", "Weld", "WeldConstraint", "Workspace",
+    "WorldPivot", "WorldPivotData",
+];
+
+/// The value a file's `class.key` needn't be stored as (`decode` leaves it
+/// out): what `Document::prop` answers for a missing one, when that is also
+/// the reflection database's default (what a save writes back for it). None
+/// keeps every value: names read straight from the map (KEEP_STORED), XML
+/// and content twins, aliases, references and binary data.
+///
+/// Most of a big place is defaults (a 44 MB place: 25.6 M stored values,
+/// 69% defaults, 4.8 GB parsed), and the map holds each as a ~90-byte entry.
+pub fn implied_default(class: &str, key: &str) -> Option<Variant> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<rustc_hash::FxHashMap<(Box<str>, Box<str>), Option<Variant>>> =
+            Default::default();
+    }
+    if let Some(v) = CACHE.with(|c| c.borrow().get(&(class.into(), key.into())).cloned()) {
+        return v;
+    }
+    let v = (|| {
+        if KEEP_STORED.contains(&key) || key.ends_with("_XML") || key.ends_with("Content") {
+            return None;
+        }
+        // A content property, or the twin of one (MeshId ↔ MeshContent).
+        if content_twin(key).is_some() {
+            return None;
+        }
+        let plan = prop_plan(ustr(class), ustr(key))?;
+        if plan.stored_as.is_some() || plan.twin.is_some() {
+            return None;
+        }
+        let fixed = plan.fixed.clone()?;
+        let db = db();
+        let c = db.classes.get(class)?;
+        if db.find_default_property(c, key) != Some(&fixed) {
+            return None;
+        }
+        match fixed {
+            Variant::Ref(_)
+            | Variant::BinaryString(_)
+            | Variant::SharedString(_)
+            | Variant::Content(_)
+            | Variant::ContentId(_)
+            | Variant::UniqueId(_) => None,
+            v => Some(v),
+        }
+    })();
+    CACHE.with(|c| c.borrow_mut().insert((class.into(), key.into()), v.clone()));
+    v
+}
+
 /// The instance-independent part of `Document::prop`'s fallback chain.
 struct PropPlan {
     stored_as: Option<Ustr>,
@@ -986,6 +1070,9 @@ impl Document {
             builder.add_property(*k, v.clone());
         }
         let mut dom = WeakDom::new(builder);
+        // (the table sized once: growing it by doubling rehashed a million
+        // instances' entries ~20 times, the old table held alongside)
+        dom.reserve(self.dom.len());
         let kids = root.children().to_vec();
         let copies = self.dom.clone_multiple_into_external(&kids, &mut dom);
         let new_root = dom.root_ref();
@@ -1013,7 +1100,15 @@ impl Document {
         if xml {
             rbx_xml::from_reader_default(Cursor::new(bytes)).map_err(|e| e.to_string())
         } else {
-            rbx_binary::from_reader(Cursor::new(bytes)).map_err(|e| e.to_string())
+            // RUSTUDIO_KEEP_DEFAULTS=1 stores every value the file has, to
+            // rule the leaving-out (implied_default) in or out of a bug.
+            static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let keep = *KEEP.get_or_init(|| std::env::var_os("RUSTUDIO_KEEP_DEFAULTS").is_some_and(|v| v != "0"));
+            let skip: &dyn Fn(&str, &str) -> Option<Variant> = if keep { &|_, _| None } else { &implied_default };
+            rbx_binary::Deserializer::new()
+                .skip_defaults(skip)
+                .deserialize(Cursor::new(bytes))
+                .map_err(|e| e.to_string())
         }
     }
 
@@ -1023,7 +1118,12 @@ impl Document {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         crate::load_trace::mark(&format!("place read ({:.1} MB)", bytes.len() as f64 / 1e6));
         let dom = Self::decode(&bytes)?;
-        crate::load_trace::mark("place parsed");
+        if crate::load_trace::on() {
+            let n: usize = dom.descendants().map(|i| i.properties.len()).sum();
+            crate::load_trace::mark(&format!("place parsed ({n} stored values)"));
+        } else {
+            crate::load_trace::mark("place parsed");
+        }
         let title = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -2767,4 +2867,188 @@ pub fn new_script_guid() -> String {
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02X}")).collect();
     format!("{{{}-{}-{}-{}-{}}}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+#[cfg(test)]
+mod implied_default_tests {
+    use super::*;
+    use rbx_dom_weak::types::{Color3, NumberSequence, NumberSequenceKeypoint};
+
+    fn decode_with(bytes: &[u8], lean: bool) -> WeakDom {
+        let keep = |_: &str, _: &str| -> Option<Variant> { None };
+        let skip: &dyn Fn(&str, &str) -> Option<Variant> = if lean { &implied_default } else { &keep };
+        rbx_binary::Deserializer::new().skip_defaults(skip).deserialize(Cursor::new(bytes)).unwrap()
+    }
+
+    /// A place as Studio saves one: every instance carries every property
+    /// its class has (the defaults included), some changed.
+    fn studio_like_place() -> Vec<u8> {
+        let db = db();
+        let full = |class: &str| {
+            let mut b = InstanceBuilder::new(class);
+            let c = db.classes.get(class).unwrap();
+            for cl in db.superclasses_iter(c) {
+                for (k, v) in &cl.default_properties {
+                    let k: &str = k.as_ref();
+                    if !b.has_property(k) {
+                        b.add_property(k, v.clone());
+                    }
+                }
+            }
+            b
+        };
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let ws = dom.insert(root, full("Workspace").with_name("Workspace"));
+        let ss = dom.insert(root, full("ServerStorage").with_name("ServerStorage"));
+        for i in 0..40 {
+            let model = dom.insert(ws, full("Model").with_name(format!("M{i}")));
+            let mut p = full("Part").with_name(format!("P{i}"));
+            if i % 3 == 0 {
+                p.add_property("Transparency", Variant::Float32(0.5));
+                p.add_property("Anchored", Variant::Bool(true));
+                p.add_property("Color", Variant::Color3uint8(rbx_dom_weak::types::Color3uint8::new(10, 20, 30)));
+            }
+            let part = dom.insert(model, p);
+            let mut e = full("ParticleEmitter");
+            if i % 2 == 0 {
+                e.add_property("Rate", Variant::Float32(40.0));
+                e.add_property(
+                    "Transparency",
+                    Variant::NumberSequence(NumberSequence {
+                        keypoints: vec![NumberSequenceKeypoint::new(0.0, 0.2, 0.0), NumberSequenceKeypoint::new(1.0, 1.0, 0.0)],
+                    }),
+                );
+                e.add_property("Color", Variant::ColorSequence(rbx_dom_weak::types::ColorSequence {
+                    keypoints: vec![
+                        rbx_dom_weak::types::ColorSequenceKeypoint::new(0.0, Color3::new(1.0, 0.0, 0.0)),
+                        rbx_dom_weak::types::ColorSequenceKeypoint::new(1.0, Color3::new(0.0, 0.0, 1.0)),
+                    ],
+                }));
+            }
+            dom.insert(part, e);
+            dom.insert(part, full("Decal"));
+            dom.insert(part, full("Attachment").with_name("A"));
+            let mut v = full("NumberValue");
+            if i % 4 == 0 {
+                v.add_property("Value", Variant::Float64(7.0));
+            }
+            dom.insert(model, v);
+            dom.insert(model, full("Humanoid"));
+            dom.insert(ss, full("Sound").with_name(format!("S{i}")));
+            let mut g = full("ScreenGui");
+            if i % 5 == 0 {
+                g.add_property("IgnoreGuiInset", Variant::Bool(true));
+            }
+            let gui = dom.insert(ss, g);
+            let mut l = full("TextLabel");
+            l.add_property("Text", Variant::String(format!("label {i}")));
+            dom.insert(gui, l);
+        }
+        let kids = dom.root().children().to_vec();
+        let mut out = Vec::new();
+        rbx_binary::to_writer(&mut out, &dom, &kids).unwrap();
+        out
+    }
+
+    /// Both documents walked in the same order: every `stride`-th instance's
+    /// reflected properties must read the same through `Document::prop`.
+    /// Returns (values compared, values stored kept / full).
+    fn same_reads(bytes: &[u8], stride: usize) -> (usize, usize, usize) {
+        let full = Document::from_dom(decode_with(bytes, false), DocKind::Place, None, "full".into());
+        let lean = Document::from_dom(decode_with(bytes, true), DocKind::Place, None, "lean".into());
+        let db = db();
+        let (mut a, mut b) = (vec![full.dom.root_ref()], vec![lean.dom.root_ref()]);
+        let (mut checked, mut n, mut stored_full, mut stored_lean) = (0, 0usize, 0, 0);
+        while let (Some(ra), Some(rb)) = (a.pop(), b.pop()) {
+            let ia = full.dom.get_by_ref(ra).unwrap();
+            let ib = lean.dom.get_by_ref(rb).unwrap();
+            assert_eq!((ia.class, &ia.name, ia.children().len()), (ib.class, &ib.name, ib.children().len()));
+            stored_full += ia.properties.len();
+            stored_lean += ib.properties.len();
+            if n % stride == 0 {
+                if let Some(c) = db.classes.get(ia.class.as_str()) {
+                    for cl in db.superclasses_iter(c) {
+                        for k in cl.properties.keys() {
+                            let (va, vb) = (full.prop(ra, k), lean.prop(rb, k));
+                            // (refs differ between two decodes, and so do UniqueIds a
+                            // file repeats, made anew on insert; NaN isn't equal to itself)
+                            if matches!(va, Some(Variant::Ref(_) | Variant::UniqueId(_))) || va != va {
+                                continue;
+                            }
+                            assert_eq!(va, vb, "{}.{k} ({})", ia.class, ia.name);
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+            n += 1;
+            a.extend_from_slice(ia.children());
+            b.extend_from_slice(ib.children());
+        }
+        assert!(a.is_empty() && b.is_empty());
+        (checked, stored_lean, stored_full)
+    }
+
+    #[test]
+    fn leaving_out_defaults_reads_the_same() {
+        let bytes = studio_like_place();
+        let (checked, lean, full) = same_reads(&bytes, 1);
+        assert!(checked > 10_000, "{checked}");
+        // (and far less is stored)
+        assert!(lean * 2 < full, "{lean} of {full}");
+    }
+
+    #[test]
+    fn leaving_out_defaults_saves_the_same() {
+        let bytes = studio_like_place();
+        let save = |lean: bool| {
+            let dom = decode_with(&bytes, lean);
+            let kids = dom.root().children().to_vec();
+            let mut out = Vec::new();
+            rbx_binary::to_writer(&mut out, &dom, &kids).unwrap();
+            decode_with(&out, false)
+        };
+        let (full, lean) = (save(false), save(true));
+        let (mut a, mut b) = (vec![full.root_ref()], vec![lean.root_ref()]);
+        while let (Some(ra), Some(rb)) = (a.pop(), b.pop()) {
+            let ia = full.get_by_ref(ra).unwrap();
+            let ib = lean.get_by_ref(rb).unwrap();
+            for (k, v) in ia.properties.iter() {
+                if matches!(v, Variant::Ref(_) | Variant::UniqueId(_)) {
+                    continue;
+                }
+                // A property no instance of the class kept isn't written:
+                // Roblox reads it as the default, as implied_default says.
+                let got = ib.properties.get(k).cloned().or_else(|| implied_default(ia.class.as_str(), k.as_str()));
+                assert_eq!(got.as_ref(), Some(v), "{}.{k}", ia.class);
+            }
+            a.extend_from_slice(ia.children());
+            b.extend_from_slice(ib.children());
+        }
+    }
+
+    #[test]
+    fn implied_default_keeps_direct_reads() {
+        // Read straight from the map by name elsewhere: always stored.
+        for (class, key) in [("Part", "Size"), ("Part", "CFrame"), ("Folder", "Attributes"), ("Script", "Source"), ("Sound", "Playing")] {
+            assert_eq!(implied_default(class, key), None, "{class}.{key}");
+        }
+        // Content twins and references: stored.
+        assert_eq!(implied_default("MeshPart", "MeshId"), None);
+        assert_eq!(implied_default("Weld", "Part0"), None);
+        // A plain default is left out.
+        assert_eq!(implied_default("Part", "Transparency"), Some(Variant::Float32(0.0)));
+    }
+
+    /// RUSTUDIO_TEST_PLACE=<a .rbxl>: the same check over a real place
+    /// (every 37th instance; `cargo test -p rustudio-core real_place -- --ignored`).
+    #[test]
+    #[ignore]
+    fn real_place_reads_the_same() {
+        let Some(path) = std::env::var_os("RUSTUDIO_TEST_PLACE") else { return };
+        let bytes = std::fs::read(path).unwrap();
+        let (checked, lean, full) = same_reads(&bytes, 37);
+        eprintln!("{checked} values compared; stored {lean} of {full}");
+    }
 }

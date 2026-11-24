@@ -146,6 +146,17 @@ impl InstanceBuilder {
             || self.shared.as_ref().is_some_and(|m| m.contains_key(&key))
     }
 
+    /// Takes the properties added so far (not a `with_prop_map` map's).
+    pub fn take_properties(&mut self) -> Vec<(Ustr, Variant)> {
+        std::mem::take(&mut self.properties)
+    }
+
+    /// `with_prop_map` in place: the builder starts from `map`; properties
+    /// added afterwards are set over it.
+    pub fn set_prop_map(&mut self, map: PropMap) {
+        self.shared = Some(map);
+    }
+
     /// Start from a copy of another instance's property map: it keeps
     /// sharing its class's common values (`WeakDom::share_properties`),
     /// where `with_properties` would copy every value.

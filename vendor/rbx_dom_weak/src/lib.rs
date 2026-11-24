@@ -100,7 +100,7 @@ pub use ustr::{ustr, Ustr, UstrMap, UstrSet};
 pub use crate::{
     dom::WeakDom,
     instance::{Instance, InstanceBuilder},
-    props::PropMap,
+    props::{share_maps, PropMap},
     viewer::{DomViewer, ViewedInstance},
 };
 

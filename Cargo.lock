@@ -3845,8 +3845,6 @@ dependencies = [
 [[package]]
 name = "rbx_binary"
 version = "3.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f57d390e10fc236919088e9d973774bf006dcab137b443d1341a39317ebee4a"
 dependencies = [
  "ahash",
  "log",
